@@ -62,6 +62,7 @@ Pipfile.lock
 
 # Environment variables
 .env
+venv/
 
 # Model files
 models/
@@ -74,4 +75,3 @@ ImageNotScan/
 # Downloaded images
 downloads/
 
-venv/
