@@ -73,3 +73,5 @@ ImageNotScan/
 
 # Downloaded images
 downloads/
+
+venv/
