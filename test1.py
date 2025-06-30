@@ -17,6 +17,9 @@ def download_image(url, save_path='downloaded_image.jpg'):
 
 # === Step 2: Load YOLOv8 model and run prediction ===
 def predict_on_image(image_path, model_path='best.pt', confidence_threshold=0.45):
+    # Read image as-is (no rotation)
+    img = cv2.imread(image_path)
+
     # Allow PyTorch to unpickle the YOLO model class
     with torch.serialization.safe_globals(["ultralytics.nn.tasks.DetectionModel"]):
         model = YOLO(model_path)
@@ -47,9 +50,9 @@ def predict_on_image(image_path, model_path='best.pt', confidence_threshold=0.45
 
 # === Main Execution ===
 if __name__ == "__main__":
-    image_url = "https://cdn.qoneqt.com/uploads/28696/aadhar_front_ALhML03AXG.jpeg"  # Replace with your own image URL
-    local_image_path = download_image(image_url)
-    predict_on_image(local_image_path, model_path='/Users/hqpl/Desktop/aadhar_testing/AadharAuth/models/best1.pt', confidence_threshold=0.45)  # Update with your model path
+    # Use a local image path directly
+    image_path = "/Users/hqpl/Desktop/aadhar_testing/AadharAuth/pipeline_output/user1a/d370c00beedf8192978e602983ea74dd/1_front_back_cards/tmp80rsgckv_aadhar_front_conf67.jpg"  # Set your local image path here
+    predict_on_image(image_path, model_path='/Users/hqpl/Desktop/aadhar_testing/AadharAuth/models/best.pt', confidence_threshold=0.45)  # Update with your model path
 
 
 #  from ultralytics import YOLO
