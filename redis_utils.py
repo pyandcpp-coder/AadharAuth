@@ -16,7 +16,7 @@ r = redis.StrictRedis(
     host=REDIS_HOST,
     port=REDIS_PORT,
     password=REDIS_PASSWORD,
-    decode_responses=False  # keep binary mode
+    # decode_responses=True  # changed to True for human-readable keys
 )
 
 def cache_file(key: str, filepath: str):

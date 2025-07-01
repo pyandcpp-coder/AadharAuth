@@ -28,7 +28,7 @@ import pickle
 def get_redis_client():
     return redis.Redis(
         host=os.environ.get('REDIS_HOST'),
-        port=int(os.environ.get('REDIS_PORT')),
+        port=os.environ.get('REDIS_PORT'),
         password=os.environ.get('REDIS_PASSWORD'),
         decode_responses=False  # changed to True for human-readable keys
     )
@@ -38,7 +38,7 @@ def save_aadhar_to_redis(aadhar_number, data):
     r.set(f"aadhar:{aadhar_number}", pickle.dumps(data))
 
 def get_aadhar_from_redis(aadhar_number):
-    r = get_redis_client() 
+    r = get_redis_client()
     val = r.get(f"aadhar:{aadhar_number}")
     if val:
         return pickle.loads(val)

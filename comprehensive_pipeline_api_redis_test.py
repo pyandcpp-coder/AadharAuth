@@ -135,26 +135,10 @@ async def process_aadhaar(request: AadhaarProcessRequest):
     csv_path = Path("/Users/hqpl/Desktop/aadhar_testing/AadharAuth/data/summary.csv")
     json_path = Path("/Users/hqpl/Desktop/aadhar_testing/AadharAuth/data/summary.json")
 
-    # Check for duplicate aadharNumber in PKL (across all users)
-    aadhar_number = main_data.get('aadharNumber', '').replace(' ', '')
-    exists = False
-    existing_data = None
-    if pkl_path.exists() and aadhar_number:
-        try:
-            with open(pkl_path, 'rb') as pf:
-                all_data = pickle.load(pf)
-            for entry in all_data:
-                existing_aadhar = entry.get('aadharNumber', '').replace(' ', '')
-                if existing_aadhar and existing_aadhar == aadhar_number:
-                    exists = True
-                    existing_data = entry
-                    break
-        except Exception as e:
-            logger.error(f"Failed to check PKL for duplicates: {e}")
-
-    if exists:
-        shutil.rmtree(user_download_dir, ignore_errors=True)
-        return JSONResponse(content={"status": "aadhar number exists", "data": existing_data})
+    # Ensure data directory exists before saving files
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    pkl_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(json_path, 'w', encoding='utf-8') as jf:
         json.dump(main_data, jf, indent=4, ensure_ascii=False)
