@@ -20,8 +20,29 @@ import time
 from urllib.parse import urlparse
 from fastapi.staticfiles import StaticFiles
 
-from redis_utils import get_file_from_cache, cache_file
-from redis_utils import cache_json
+from redis_utils import get_file_from_cache, cache_file, cache_json
+# --- Add these imports for new Aadhaar Redis logic ---
+import redis
+import pickle
+
+def get_redis_client():
+    return redis.Redis(
+        host=os.environ.get('REDIS_HOST'),
+        port=int(os.environ.get('REDIS_PORT')),
+        password=os.environ.get('REDIS_PASSWORD'),
+        decode_responses=False  # changed to True for human-readable keys
+    )
+
+def save_aadhar_to_redis(aadhar_number, data):
+    r = get_redis_client()
+    r.set(f"aadhar:{aadhar_number}", pickle.dumps(data))
+
+def get_aadhar_from_redis(aadhar_number):
+    r = get_redis_client() 
+    val = r.get(f"aadhar:{aadhar_number}")
+    if val:
+        return pickle.loads(val)
+    return None
 
 
 import torch
@@ -587,6 +608,43 @@ async def process_aadhaar_task(task_id: str, user_id: str, front_url: str, back_
 
         if 'error' in results:
             raise ValueError(f"Pipeline failed at step '{results.get('step')}': {results['error']}")
+
+        # --- Extract main fields for duplicate check ---
+        def extract_main_fields(organized_results: Dict[str, Any]) -> Dict[str, Any]:
+            fields = ['aadharNumber', 'dob', 'gender', 'name', 'address', 'pincode']
+            data = {key: "" for key in fields}
+            for side in ['front', 'back']:
+                for card in organized_results.get(side, {}).values():
+                    for field in fields:
+                        if field in card['entities'] and card['entities'][field]:
+                            text = card['entities'][field][0].get('extracted_text', '')
+                            if text:
+                                data[field] = text
+            return data
+
+        main_data = extract_main_fields(results['organized_results'])
+        main_data['User ID'] = user_id
+        aadhar_number = main_data.get('aadharNumber', '').replace(' ', '')
+        if aadhar_number:
+            existing = get_aadhar_from_redis(aadhar_number)
+            if existing:
+                shutil.rmtree(user_download_dir, ignore_errors=True)
+                processing_tasks[task_id].update({
+                    'status': 'duplicate',
+                    'message': 'Aadhaar already exists',
+                    'results': existing,
+                    'processing_time': time.time() - start_time
+                })
+                logger.info(f"Task {task_id}: Aadhaar already exists in Redis.")
+                return
+            # Save to Redis
+            save_aadhar_to_redis(aadhar_number, main_data)
+
+        # --- Save PKL to Redis as well (optional, for all data) ---
+        import io
+        all_data = [main_data]
+        r = get_redis_client()
+        r.set("summary.pkl", pickle.dumps(all_data))
 
         final_json_path = pipeline.save_results_to_json(results['organized_results'])
         if not final_json_path:
