@@ -81,7 +81,7 @@ def extract_main_fields(organized_results: Dict[str, Any]) -> Dict[str, Any]:
                         data[field] = text
     return data
 
-@app.post("/process", response_class=JSONResponse)
+@app.post("/verify_aadhar", response_class=JSONResponse)
 async def process_aadhaar(request: AadhaarProcessRequest):
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Service Unavailable: Pipeline not initialized")
@@ -179,4 +179,4 @@ async def process_aadhaar(request: AadhaarProcessRequest):
 # Remove the GET status endpoint
 
 if __name__ == "__main__":
-    uvicorn.run("aadhaar_pipeline_api:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("aadhaar_pipeline_api:app", host="0.0.0.0", port=8200, reload=True)
