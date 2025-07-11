@@ -37,7 +37,7 @@ class AadhaarProcessRequest(BaseModel):
     user_id: str = "default_user"
     front_url: HttpUrl
     back_url: HttpUrl
-    confidence_threshold: float = Field(0.4, ge=0.0, le=1.0)
+    confidence_threshold: float = Field(0.15, ge=0.0, le=1.0)
 
 @app.on_event("startup")
 async def startup_event():
@@ -134,6 +134,7 @@ async def process_aadhaar(request: AadhaarProcessRequest):
     pkl_path = Path("/Users/hqpl/Desktop/aadhar_testing/AadharAuth/data/summary.pkl")
     csv_path = Path("/Users/hqpl/Desktop/aadhar_testing/AadharAuth/data/summary.csv")
     json_path = Path("/Users/hqpl/Desktop/aadhar_testing/AadharAuth/data/summary.json")
+
     
      # Check for duplicate aadharNumber in PKL (across all users)
     aadhar_number = main_data.get('aadharNumber', '').replace(' ', '')
@@ -154,7 +155,13 @@ async def process_aadhaar(request: AadhaarProcessRequest):
 
     if exists:
         shutil.rmtree(user_download_dir, ignore_errors=True)
-        return JSONResponse(content={"status": "aadhar number exists", "data": existing_data})
+        minimal_data = {
+            "name": existing_data.get("name", ""),
+            "aadharNumber": existing_data.get("aadharNumber", ""),
+            "matched_user_id": existing_data.get("User ID", "")
+        }
+        return JSONResponse(content={"status": "Aadhar Data Already Exists", "data": minimal_data})
+
     # Ensure data directory exists before saving files
 
     # Ensure data directory exists before saving files
