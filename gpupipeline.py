@@ -26,22 +26,37 @@ from PIL import Image
 from pydantic import BaseModel, Field, HttpUrl
 from ultralytics import YOLO
 
+from ultralytics.utils import loss as ultralytics_loss
+
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"Running on device: {device.upper()}")
+
+
 class ComprehensiveAadhaarPipeline:
-    def __init__(self, model1_path, model2_path, other_lang_code='hin+tel+ben'):
+    def __init__(self, model1_path, model2_path, other_lang_code='hin+tel+ben', device='cpu'):
         self.model1_path = model1_path
         self.model2_path = model2_path
+        self.device = device
         
         if not Path(self.model1_path).exists():
             raise FileNotFoundError(f"Model1 not found at {self.model1_path}")
         if not Path(self.model2_path).exists():
             raise FileNotFoundError(f"Model2 not found at {self.model2_path}")
+            
+        logger.info("Applying patch for legacy DFLoss model compatibility...")
+        class DFLoss:
+            """Dummy DFLoss class to fix model loading for older ultralytics versions."""
+            pass
 
-        self.model1 = YOLO(self.model1_path)
-        self.model2 = YOLO(self.model2_path)
+        ultralytics_loss.DFLoss = DFLoss
+        logger.info(f"Loading models to device '{self.device}'...")
+        self.model1 = YOLO(self.model1_path).to(self.device)
+        self.model2 = YOLO(self.model2_path).to(self.device)
+        logger.info("Models loaded successfully.")
         
         self.other_lang_code = other_lang_code
         self._check_tesseract()
@@ -64,7 +79,7 @@ class ComprehensiveAadhaarPipeline:
         for image_path in image_paths:
             img = cv2.imread(str(image_path))
             if img is None: continue
-            results = self.model1(img)
+            results = self.model1(img, device=self.device)
             for box in results[0].boxes:
                 if float(box.conf[0]) < confidence_threshold: continue
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -82,11 +97,9 @@ class ComprehensiveAadhaarPipeline:
                     h, w = img.shape[:2]
                     if h > w:
                         img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-                    
                     osd = pytesseract.image_to_osd(img, config='--psm 0', output_type=pytesseract.Output.DICT)
                     rotation_angle = osd.get('rotate', 0)
                     confidence = osd.get('orientation_conf', 0.0)
-
                     corrected_img = img
                     if rotation_angle != 0 and confidence >= osd_confidence:
                         if rotation_angle == 180:
@@ -95,7 +108,6 @@ class ComprehensiveAadhaarPipeline:
                             corrected_img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
                         elif rotation_angle == 270:
                              corrected_img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                    
                     corrected_card_data[card_type].append(corrected_img)
                 except Exception as e:
                     logger.error(f"Error during orientation correction: {e}. Using pre-corrected image.")
@@ -105,47 +117,38 @@ class ComprehensiveAadhaarPipeline:
     def process_images(self, image_paths: List[str], confidence_threshold: float):
         try:
             organized_results = {'front': {'entities': {}}, 'back': {'entities': {}}}
-            
             cropped_data = self.detect_and_crop_cards(image_paths, confidence_threshold)
             if not cropped_data.get('front') and not cropped_data.get('back'):
                 return {'error': 'No Aadhaar cards detected.'}
-
             corrected_data = self.correct_card_orientation(cropped_data)
-
             for card_type, images in corrected_data.items():
                 for card_image in images:
-                    results = self.model2(card_image)
+                    results = self.model2(card_image, device=self.device)
                     for box in results[0].boxes:
                         if float(box.conf[0]) < confidence_threshold: continue
-                        
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
                         entity_class = self.entity_classes.get(int(box.cls[0]), "unknown")
-                        
                         entity_crop = card_image[y1:y2, x1:x2]
                         if entity_crop.size == 0: continue
-
                         try:
                             pil_img = Image.fromarray(cv2.cvtColor(entity_crop, cv2.COLOR_BGR2GRAY))
                             lang_to_use = self.other_lang_code if entity_class.endswith('_other_lang') else 'eng'
                             text = pytesseract.image_to_string(pil_img, lang=lang_to_use, config='--psm 6').strip()
-                            
                             if text:
                                 if entity_class not in organized_results[card_type]['entities']:
                                     organized_results[card_type]['entities'][entity_class] = []
-                                
                                 organized_results[card_type]['entities'][entity_class].append({
                                     'confidence': float(box.conf[0]),
                                     'extracted_text': ' '.join(text.split())
                                 })
                         except Exception as ocr_error:
                             logger.error(f"OCR failed for entity {entity_class}: {ocr_error}")
-
             return {'organized_results': organized_results}
         except Exception as e:
             logger.error(f"Unhandled error in pipeline: {e}\n{traceback.format_exc()}")
             return {'error': str(e)}
 
-app = FastAPI(title="Aadhaar Processing API", version="3.1.0-with-statuses")
+app = FastAPI(title="Aadhaar Processing API (GPU Enabled)", version="4.1.0-patched")
 
 class Config:
     BASE_DIR = Path(__file__).parent
@@ -171,7 +174,8 @@ async def startup_event():
         config.SUMMARY_DATA_DIR.mkdir(parents=True, exist_ok=True)
         pipeline = ComprehensiveAadhaarPipeline(
             model1_path=str(config.MODEL1_PATH),
-            model2_path=str(config.MODEL2_PATH)
+            model2_path=str(config.MODEL2_PATH),
+            device=device 
         )
     except Exception as e:
         logger.critical(f"Pipeline initialization failed: {e}", exc_info=True)
@@ -219,14 +223,12 @@ async def verify_aadhaar_sync(request: AadhaarProcessRequest):
 
         result = pipeline.process_images([str(front_path), str(back_path)], request.confidence_threshold)
         
-        # --- MODIFIED ERROR HANDLING ---
         if 'error' in result:
             if result['error'] == 'No Aadhaar cards detected.':
                 return JSONResponse(
                     status_code=404, 
                     content={"status": "No Aadhaar Card Detected", "data": None}
                 )
-            # For all other unexpected errors, raise a 500
             raise HTTPException(status_code=500, detail=f"Internal Server Error: {result['error']}")
 
         organized = result.get('organized_results', {})
