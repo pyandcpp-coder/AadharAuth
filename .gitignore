@@ -65,7 +65,7 @@ Pipfile.lock
 venv/
 
 # Model files
-models/
+Models/*.pt
 
 # Output and data folders
 data/
