@@ -1,5 +1,3 @@
-# final_api_with_statuses.py
-
 import asyncio
 import hashlib
 import json
@@ -274,4 +272,4 @@ async def verify_aadhaar_sync(request: AadhaarProcessRequest):
             shutil.rmtree(user_download_dir, ignore_errors=True)
 
 if __name__ == "__main__":
-    uvicorn.run("final_api_with_statuses:app", host="0.0.0.0", port=8200, reload=True)
+    uvicorn.run("gpupipeline:app", host="0.0.0.0", port=8200, reload=True)
