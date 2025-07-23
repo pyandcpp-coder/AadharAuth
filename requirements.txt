@@ -1,0 +1,15 @@
+aiofiles==23.2.1
+aiohttp==3.9.5
+certifi>=2023.7.22
+charset-normalizer>=3.1.0
+fastapi==0.110.0
+numpy==1.26.4
+opencv-python==4.9.0.80
+pandas==2.2.1
+Pillow==10.2.0
+python-dotenv==1.0.1
+pytesseract==0.3.10
+pydantic==1.10.13
+torch==2.3.0 
+uvicorn==0.29.0
+ultralytics==8.2.15
