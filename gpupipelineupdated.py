@@ -6,6 +6,7 @@ import math # Added for rotation calculation
 import os
 import pickle
 import shutil
+import re
 import sys
 import tempfile
 import time
@@ -37,11 +38,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# --- Core Pipeline Logic (Refactored for Fully In-Memory Processing) ---
+# --- Core Pipeline Logic (Fully In-Memory) ---
 
 class ComprehensiveAadhaarPipeline:
-    ### MODIFIED: Removed output_base_dir from constructor ###
-    def __init__(self, model1_path, model2_path, confidence_threshold=0.10, other_lang_code='hin+tel+ben'):
+    # MODIFIED: Removed confidence_threshold from __init__ as it's now stateless regarding the threshold.
+    def __init__(self, model1_path, model2_path, other_lang_code='hin+tel+ben'):
         ### NEW: Dynamic device selection (CUDA/CPU) ###
         if torch.cuda.is_available():
             self.device = "cuda"
@@ -66,7 +67,6 @@ class ComprehensiveAadhaarPipeline:
         self.model1 = YOLO(self.model1_path)
         self.model2 = YOLO(self.model2_path)
         
-        self.default_confidence_threshold = confidence_threshold
         self.other_lang_code = other_lang_code
 
         self._check_tesseract()
@@ -76,11 +76,10 @@ class ComprehensiveAadhaarPipeline:
         logger.info(f"Model2 classes: {self.model2.names}")
 
         self.card_classes = {i: name for i, name in self.model1.names.items()}
-
         self.entity_classes = {
-            0: 'aadharNumber', 1: 'address', 2: 'address_other_lang', 3: 'city',
+            0: 'aadharnumber', 1: 'address', 2: 'address_other_lang', 3: 'city',
             4: 'dob', 5: 'gender', 6: 'gender_other_lang', 7: 'mobile_no',
-            8: 'name', 9: 'name_otherlang', 10: 'pincode', 11: 'state'
+            8: 'name', 9: 'name_otherlang', 10: 'pincode'
         }
         logger.info(f"✅ Pipeline initialized to use '{self.other_lang_code}' for other language fields.")
 
@@ -94,206 +93,351 @@ class ComprehensiveAadhaarPipeline:
              logger.critical(f"An error occurred while checking Tesseract: {e}")
              raise RuntimeError(f"Error checking Tesseract: {e}")
 
-    def detect_and_crop_cards(self, image_arrays: List[np.ndarray], confidence_threshold: float) -> Dict[str, List[np.ndarray]]:
-        """Step 1: Detect Aadhaar front and back cards and crop them from in-memory images."""
-        logger.info(f"\n🔍 Step 1: Detecting Aadhaar cards in {len(image_arrays)} images (Threshold: {confidence_threshold})")
+    def detect_and_crop_cards(self, image_paths: List[str], confidence_threshold: float) -> Dict[str, List[Dict[str, Any]]]:
+        """Step 1: Detect Aadhaar front/back cards and pass cropped image data (np.array) forward."""
+        logger.info(f"\n🔍 Step 1: Detecting Aadhaar cards in {len(image_paths)} images (Threshold: {confidence_threshold})")
         cropped_cards = {'front': [], 'back': []}
-        for i, img in enumerate(image_arrays):
-            logger.info(f"  Processing image index: {i}")
-            results = self.model1(img, device=self.device)
+        for image_path in image_paths:
+            logger.info(f"  Processing: {Path(image_path).name}")
+            results = self.model1(str(image_path), device=self.device)
+            img = cv2.imread(str(image_path))
+            input_filename = Path(image_path).stem
             detected = False
             for box in results[0].boxes:
                 if float(box.conf[0]) < confidence_threshold: continue
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 class_name = self.card_classes.get(int(box.cls[0]), "unknown")
                 if class_name == 'print_aadhar':
-                    raise ValueError("Print Aadhaar detected - processing stopped for security reasons")
+                    raise ValueError("print_aadhar_detected")
                 if class_name not in ['aadhar_front', 'aadhar_back']: continue
                 detected = True
                 crop = img[y1:y2, x1:x2]
-                cropped_cards[class_name.replace('aadhar_', '')].append(crop)
-                logger.info(f"    ✅ Cropped {class_name} in-memory.")
+                card_type = class_name.replace('aadhar_', '')
+                card_data = {
+                    "image": crop,
+                    "name": f"{input_filename}_{class_name}_conf{int(float(box.conf[0])*100)}",
+                    "type": card_type
+                }
+                cropped_cards[card_type].append(card_data)
+                logger.info(f"    ✅ Detected {class_name}")
             if not detected:
-                logger.warning(f"    ⚠️ No Aadhaar card detected in image index {i}.")
+                logger.warning(f"    ⚠️ No Aadhaar card detected in {Path(image_path).name}.")
         return cropped_cards
 
-    def _get_rotated_image(self, image: np.ndarray, angle: float) -> np.ndarray:
-        """Rotates an image by a given angle, expanding the canvas to avoid cropping."""
-        (h, w) = image.shape[:2]
-        (cX, cY) = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D((cX, cY), angle, 1.0)
-        cos = np.abs(M[0, 0])
-        sin = np.abs(M[0, 1])
-        nW = int((h * sin) + (w * cos))
-        nH = int((h * cos) + (w * sin))
-        M[0, 2] += (nW / 2) - cX
-        M[1, 2] += (nH / 2) - cY
-        return cv2.warpAffine(image, M, (nW, nH))
+    def detect_entities_in_cards(self, cropped_cards: Dict[str, List[Dict[str, Any]]], confidence_threshold: float):
+        """Step 2: Detect entities using in-memory card image data."""
+        all_card_data = cropped_cards.get('front', []) + cropped_cards.get('back', [])
+        logger.info(f"\n🔍 Step 2: Detecting entities in {len(all_card_data)} cards (Threshold: {confidence_threshold})")
+        all_detections = {}
 
-    def correct_card_orientation_opencv(self, cropped_cards: Dict[str, List[np.ndarray]], osd_confidence: float = 1.0) -> Dict[str, List[np.ndarray]]:
-        """Step 1.5: Corrects card orientation using in-memory numpy arrays."""
-        logger.info("\n🔄 Step 1.5: Correcting card orientation using OpenCV contours and Tesseract OSD")
-        corrected_card_arrays = {'front': [], 'back': []}
-        all_cards_to_process = []
-        all_cards_to_process.extend([(img, 'front') for img in cropped_cards.get('front', [])])
-        all_cards_to_process.extend([(img, 'back') for img in cropped_cards.get('back', [])])
+        for card_info in all_card_data:
+            card_name = card_info['name']
+            img = card_info['image']
+            card_type = card_info['type']
+            logger.info(f"  Processing: {card_name}")
+            
+            results = self.model2(img, device=self.device)
+            card_detections = []
+            
+            for box in results[0].boxes:
+                if float(box.conf[0]) < confidence_threshold: continue
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                class_name = self.entity_classes.get(int(box.cls[0]), "unknown")
+                card_detections.append({'bbox': (x1, y1, x2, y2), 'class_name': class_name, 'confidence': float(box.conf[0])})
+                
+            logger.info(f"    ✅ Detected {len(card_detections)} entities in {card_name}")
+            all_detections[card_name] = {
+                "card_image": img,
+                "card_type": card_type,
+                "detections": card_detections
+            }
+        return all_detections
 
-        if not all_cards_to_process:
-            logger.warning("  No cards to correct orientation for.")
-            return corrected_card_arrays
-
-        for i, (img, card_type) in enumerate(all_cards_to_process):
-            try:
-                if img is None:
-                    logger.warning(f"  ⚠️ Null image array for {card_type} card index {i}, skipping.")
-                    continue
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                gray = cv2.GaussianBlur(gray, (5, 5), 0)
-                edged = cv2.Canny(gray, 50, 150)
-                contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                rotated_img = img
-                if contours:
-                    main_contour = max(contours, key=cv2.contourArea)
-                    rect = cv2.minAreaRect(main_contour)
-                    angle = rect[-1]
-                    box_w, box_h = rect[1]
-                    if box_w < box_h: angle += 90
-                    logger.info(f"  Processing {card_type} card index {i}: Detected OpenCV rotation angle: {angle:.2f}°")
-                    rotated_img = self._get_rotated_image(img, angle)
-                final_corrected_img = rotated_img
-                osd = pytesseract.image_to_osd(rotated_img, config='--psm 0', output_type=pytesseract.Output.DICT)
-                rotation_angle = osd.get('rotate', 0)
-                confidence = osd.get('orientation_conf', 0.0)
-                if rotation_angle == 180 and confidence >= osd_confidence:
-                    logger.info(f"    -> Tesseract detected 180° flip (conf: {confidence:.2f}). Applying final correction.")
-                    final_corrected_img = cv2.rotate(rotated_img, cv2.ROTATE_180)
-                corrected_card_arrays[card_type].append(final_corrected_img)
-                logger.info(f"    ✅ Corrected orientation for {card_type} card index {i} in-memory.")
-            except Exception as e:
-                logger.error(f"  ❌ Error during orientation correction for {card_type} card index {i}: {e}. Using original image as fallback.", exc_info=True)
-                corrected_card_arrays[card_type].append(img)
-        return corrected_card_arrays
+    def crop_entities(self, all_detections: Dict[str, Dict[str, Any]]):
+        """Step 3: Crop individual entities and add their image data to the detection dictionary."""
+        logger.info(f"\n✂️  Step 3: Cropping individual entities")
+        for card_name, card_data in all_detections.items():
+            img = card_data['card_image']
+            for i, detection in enumerate(card_data['detections']):
+                x1, y1, x2, y2 = detection['bbox']
+                crop = img[y1:y2, x1:x2]
+                detection['cropped_image'] = crop
+                entity_key = f"{card_name}_{detection['class_name']}_{i}"
+                detection['entity_key'] = entity_key
+                logger.info(f"    ✅ Cropped entity: {entity_key}")
+        return all_detections
     
-    def detect_entities_in_card(self, card_array: np.ndarray, confidence_threshold: float) -> List[Dict]:
-        """Step 2: Detect entities in a single orientation-corrected card array."""
-        logger.info(f"  Detecting entities in a single card (Threshold: {confidence_threshold})")
-        results = self.model2(card_array, device=self.device)
-        card_detections = []
-        for box in results[0].boxes:
-            if float(box.conf[0]) < confidence_threshold: continue
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            class_name = self.entity_classes.get(int(box.cls[0]), "unknown")
-            card_detections.append({'bbox': (x1, y1, x2, y2), 'class_name': class_name, 'confidence': float(box.conf[0])})
-        logger.info(f"    ✅ Detected {len(card_detections)} entities.")
-        return card_detections
-
-    def _correct_entity_orientation_and_preprocess(self, image_array: np.ndarray, class_name: str, osd_confidence_threshold: float = 1.0) -> Optional[Image.Image]:
-        """Takes a numpy array of a cropped entity, corrects orientation, and returns a preprocessed PIL Image."""
+    def _correct_entity_orientation_and_preprocess(self, entity_image: np.ndarray, entity_key: str, osd_confidence_threshold: float = 0.5) -> Optional[Image.Image]:
+        """
+        Takes a numpy array for a single cropped entity, attempts to correct its orientation, 
+        and returns a preprocessed PIL Image without saving any files.
+        """
         try:
-            img = image_array
+            img = entity_image
             if img is None or img.size == 0:
-                 logger.warning(f"    ⚠️ Received an empty image array for entity '{class_name}', skipping.")
-                 return None
+                logger.warning(f"    ⚠️ Entity image data for {entity_key} is empty, skipping.")
+                return None
+            
             h, w = img.shape[:2]
             if h < 100:
                 scale_factor = 100 / h
                 new_w, new_h = int(w * scale_factor), int(h * scale_factor)
-                img_for_osd = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+                img_for_analysis = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
             else:
-                img_for_osd = img
-            rotation = 0
-            try:
-                osd = pytesseract.image_to_osd(img_for_osd, output_type=pytesseract.Output.DICT)
-                if osd['orientation_conf'] > osd_confidence_threshold: rotation = osd['rotate']
-            except pytesseract.TesseractError as e:
-                logger.warning(f"    ⚠️ OSD failed for {class_name} (likely too small). Assuming 0° rotation. Details: {e}")
+                img_for_analysis = img
+
+            best_rotation = self._detect_orientation_by_letters(img_for_analysis, entity_key)
+            
+            if best_rotation is None:
+                try:
+                    osd = pytesseract.image_to_osd(img_for_analysis, output_type=pytesseract.Output.DICT)
+                    if osd['orientation_conf'] > osd_confidence_threshold:
+                        best_rotation = osd['rotate']
+                        logger.info(f"    🔄 Using Tesseract OSD for {entity_key}: {best_rotation}° (conf: {osd['orientation_conf']:.2f})")
+                    else:
+                        best_rotation = 0
+                except pytesseract.TesseractError as e:
+                    logger.warning(f"    ⚠️ Both letter-based and OSD failed for {entity_key}. Assuming 0° rotation. Details: {e}")
+                    best_rotation = 0
+            
             corrected_img = img
-            if rotation != 0:
-                logger.info(f"    🔄 Fine-tuning entity {class_name} orientation by {rotation}°")
-                if rotation == 90: corrected_img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-                elif rotation == 180: corrected_img = cv2.rotate(img, cv2.ROTATE_180)
-                elif rotation == 270: corrected_img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+            if best_rotation != 0:
+                logger.info(f"    🔄 Correcting entity {entity_key} orientation by {best_rotation}°")
+                if best_rotation == 90: 
+                    corrected_img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                elif best_rotation == 180: 
+                    corrected_img = cv2.rotate(img, cv2.ROTATE_180)
+                elif best_rotation == 270: 
+                    corrected_img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+
             h_corr, w_corr = corrected_img.shape[:2]
-            if h_corr > w_corr and 'address' not in class_name:
-                logger.info(f"    ↪️ Rotating vertical entity '{class_name}' to horizontal format")
+            if h_corr > w_corr and 'address' not in entity_key:
+                logger.info(f"    ↪️ Rotating vertical entity {entity_key} to horizontal format")
                 corrected_img = cv2.rotate(corrected_img, cv2.ROTATE_90_CLOCKWISE)
+
             pil_img = Image.fromarray(cv2.cvtColor(corrected_img, cv2.COLOR_BGR2GRAY))
             return pil_img
+            
         except Exception as e:
-            logger.error(f"    ❌ Unhandled error during entity orientation/preprocessing for '{class_name}': {e}")
+            logger.error(f"    ❌ Unhandled error during entity orientation/preprocessing for {entity_key}: {e}")
             return None
 
-    ### REMOVED: save_results_to_json method is no longer needed ###
-            
-    def process_images(self, image_arrays: List[np.ndarray], user_id: str, task_id: str, confidence_threshold: float, verbose=True):
-        """Main pipeline function to process multiple in-memory images."""
+    def _detect_orientation_by_letters(self, img: np.ndarray, entity_key: str) -> Optional[int]:
+        """
+        Detect the correct orientation by analyzing letter shapes and OCR confidence
+        at different rotation angles.
+        """
         try:
-            ### REMOVED: Session directory creation ###
-            if verbose: logger.info(f"🚀 Starting Fully In-Memory Pipeline for task {task_id}")
-
-            # Step 1
-            cropped_cards = self.detect_and_crop_cards(image_arrays, confidence_threshold)
-            if not cropped_cards.get('front') and not cropped_cards.get('back'):
-                return {'error': 'No Aadhaar cards detected.', 'step': 'card_detection', 'front_detected': False, 'back_detected': False}
-
-            # Step 1.5
-            corrected_cards = self.correct_card_orientation_opencv(cropped_cards)
-
-            # Initialize results structure
-            organized_results = {
-                'front': {}, 'back': {},
-                'metadata': {
-                    'processing_timestamp': datetime.now().isoformat(),
-                    ### REMOVED: session_directory key ###
-                    'confidence_threshold_used': confidence_threshold
-                }
-            }
-
-            # Process both front and back cards
-            for card_type in ['front', 'back']:
-                for i, card_array in enumerate(corrected_cards.get(card_type, [])):
-                    card_key = f"{card_type}_card_{i}"
-                    organized_results[card_type][card_key] = {'entities': {}}
-                    
-                    logger.info(f"\n📝 Processing {card_type} card index {i}")
-                    # Step 2: Detect entities
-                    detections = self.detect_entities_in_card(card_array, confidence_threshold)
-                    
-                    # Steps 3, 4, 5: Crop, Preprocess, OCR, and Organize
-                    for detection in detections:
-                        class_name = detection['class_name']
-                        logger.info(f"  Processing entity: {class_name}")
-                        
-                        x1, y1, x2, y2 = detection['bbox']
-                        entity_crop_array = card_array[y1:y2, x1:x2]
-                        
-                        processed_pil_img = self._correct_entity_orientation_and_preprocess(entity_crop_array, class_name)
-                        
-                        extracted_text = ""
-                        if processed_pil_img:
-                            try:
-                                lang_to_use = self.other_lang_code if class_name and class_name.endswith('_other_lang') else 'eng'
-                                text = pytesseract.image_to_string(processed_pil_img, lang=lang_to_use, config='--psm 6')
-                                extracted_text = ' '.join(text.split()).strip()
-                            except Exception as e:
-                                logger.error(f"    ❌ OCR failed for {class_name}: {e}")
-                        
-                        if class_name not in organized_results[card_type][card_key]['entities']:
-                            organized_results[card_type][card_key]['entities'][class_name] = []
-                        
-                        organized_results[card_type][card_key]['entities'][class_name].append({
-                            'confidence': detection['confidence'], 'bbox': detection['bbox'],
-                            'extracted_text': extracted_text
-                        })
-
-            ### REMOVED: Call to save_results_to_json ###
-
-            if verbose: logger.info("🎉 Pipeline processing completed.")
+            rotations = [0, 90, 180, 270]
+            rotation_scores = {}
             
-            final_result = {'organized_results': organized_results}
-            final_result['front_detected'] = bool(organized_results['front'])
-            final_result['back_detected'] = bool(organized_results['back'])
-            return final_result
+            for rotation in rotations:
+                if rotation == 0:
+                    rotated_img = img
+                elif rotation == 90:
+                    rotated_img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+                elif rotation == 180:
+                    rotated_img = cv2.rotate(img, cv2.ROTATE_180)
+                elif rotation == 270:
+                    rotated_img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+                
+                score = self._calculate_orientation_score(rotated_img, rotation)
+                rotation_scores[rotation] = score
+                logger.debug(f"      Rotation {rotation}°: score = {score:.3f}")
+            
+            best_rotation = max(rotation_scores.keys(), key=lambda k: rotation_scores[k])
+            best_score = rotation_scores[best_rotation]
+            
+            if best_score > 0.1:
+                logger.info(f"    📐 Letter-based analysis for {entity_key}: {best_rotation}° (score: {best_score:.3f})")
+                return best_rotation
+            else:
+                logger.warning(f"    ⚠️ Letter-based analysis inconclusive for {entity_key} (best score: {best_score:.3f})")
+                return None
+                
+        except Exception as e:
+            logger.warning(f"    ⚠️ Error in letter-based orientation detection for {entity_key}: {e}")
+            return None
+
+    def _calculate_orientation_score(self, img: np.ndarray, rotation: int) -> float:
+        """
+        Calculate a score for how likely this orientation is correct.
+        """
+        try:
+            if len(img.shape) == 3:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img
+                
+            ocr_score = self._get_ocr_confidence_score(gray)
+            shape_score = self._analyze_letter_shapes(gray)
+            line_score = self._analyze_text_lines(gray)
+            
+            total_score = (ocr_score * 0.5 + shape_score * 0.3 + line_score * 0.2)
+            return total_score
+            
+        except Exception as e:
+            logger.debug(f"      Error calculating orientation score: {e}")
+            return 0.0
+
+    def _get_ocr_confidence_score(self, gray_img: np.ndarray) -> float:
+        """Get OCR confidence and text quality score"""
+        try:
+            psm_modes = [6, 7, 8, 13]
+            best_confidence = 0.0
+            best_text_length = 0
+            
+            for psm in psm_modes:
+                try:
+                    data = pytesseract.image_to_data(gray_img, config=f'--psm {psm}', output_type=pytesseract.Output.DICT)
+                    confidences = [int(conf) for conf in data['conf'] if int(conf) > 0]
+                    if confidences:
+                        avg_confidence = sum(confidences) / len(confidences)
+                        text_length = sum(len(text.strip()) for text in data['text'] if text.strip())
+                        
+                        if avg_confidence > best_confidence or (avg_confidence == best_confidence and text_length > best_text_length):
+                            best_confidence = avg_confidence
+                            best_text_length = text_length
+                            
+                except pytesseract.TesseractError:
+                    continue
+            
+            confidence_factor = best_confidence / 100.0
+            length_factor = min(best_text_length / 10.0, 1.0)
+            return confidence_factor * 0.7 + length_factor * 0.3
+            
+        except Exception:
+            return 0.0
+
+    def _analyze_letter_shapes(self, gray_img: np.ndarray) -> float:
+        """Analyze the shapes of detected contours to determine if they look like upright letters"""
+        try:
+            _, binary = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours: return 0.0
+            
+            upright_score = 0.0
+            valid_contours = 0
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area < 20: continue
+                x, y, w, h = cv2.boundingRect(contour)
+                if w < 5 or h < 5 or w > gray_img.shape[1] * 0.8 or h > gray_img.shape[0] * 0.8: continue
+                
+                aspect_ratio = h / w
+                if 0.3 <= aspect_ratio <= 4.0:
+                    valid_contours += 1
+                    if 1.0 <= aspect_ratio <= 2.5: upright_score += 1.0
+                    elif 0.5 <= aspect_ratio <= 3.5: upright_score += 0.7
+                    else: upright_score += 0.3
+            
+            if valid_contours == 0: return 0.0
+            return min(upright_score / valid_contours, 1.0)
+            
+        except Exception:
+            return 0.0
+
+    def _analyze_text_lines(self, gray_img: np.ndarray) -> float:
+        """Analyze text line orientation using morphological operations"""
+        try:
+            _, binary = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            
+            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 1))
+            horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
+            
+            vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 25))
+            vertical_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel)
+            
+            horizontal_pixels = cv2.countNonZero(horizontal_lines)
+            vertical_pixels = cv2.countNonZero(vertical_lines)
+            
+            total_pixels = horizontal_pixels + vertical_pixels
+            if total_pixels == 0: return 0.5
+            
+            horizontal_ratio = horizontal_pixels / total_pixels
+            return horizontal_ratio
+            
+        except Exception:
+            return 0.5
+
+    def perform_multi_language_ocr(self, all_detections: Dict[str, Dict[str, Any]]):
+        """Step 4: Correcting orientation and perform OCR on in-memory entity images."""
+        logger.info(f"\n📝 Step 4: Correcting Entity Orientation & Performing Multi-Language OCR")
+        ocr_results = {}
+        for card_name, card_data in all_detections.items():
+            for detection in card_data['detections']:
+                cropped_image = detection.get('cropped_image')
+                entity_key = detection.get('entity_key')
+                class_name = detection.get('class_name')
+
+                if cropped_image is None or entity_key is None: continue
+
+                logger.info(f"  Processing entity: {entity_key} (Class: {class_name})")
+                lang_to_use = self.other_lang_code if class_name and class_name.endswith('_other_lang') else 'eng'
+                
+                processed_pil_img = self._correct_entity_orientation_and_preprocess(cropped_image, entity_key)
+
+                if processed_pil_img:
+                    try:
+                        text = pytesseract.image_to_string(processed_pil_img, lang=lang_to_use, config='--psm 6')
+                        extracted_text = ' '.join(text.split()).strip()
+                        ocr_results[entity_key] = extracted_text
+                    except Exception as e:
+                        logger.error(f"    ❌ OCR failed for {entity_key}: {e}")
+                        ocr_results[entity_key] = None
+        return ocr_results
+
+    def organize_results_by_card_type(self, all_detections: Dict[str, Dict[str, Any]], ocr_results: Dict[str, str], confidence_threshold: float):
+        """Step 5: Organizing final results from in-memory data structures."""
+        logger.info("\n🗂️  Step 5: Organizing final results")
+        organized_results = {
+            'front': {}, 'back': {},
+            'metadata': {
+                'processing_timestamp': datetime.now().isoformat(),
+                'confidence_threshold_used': confidence_threshold
+            }
+        }
+        for card_name, card_data in all_detections.items():
+            card_type = card_data['card_type']
+            
+            if card_name not in organized_results[card_type]:
+                organized_results[card_type][card_name] = {'entities': {}}
+            
+            for detection in card_data['detections']:
+                 entity_name = detection['class_name']
+                 entity_key = detection.get('entity_key')
+                 extracted_text = ocr_results.get(entity_key)
+
+                 if entity_name not in organized_results[card_type][card_name]['entities']:
+                      organized_results[card_type][card_name]['entities'][entity_name] = []
+                 
+                 organized_results[card_type][card_name]['entities'][entity_name].append({
+                     'confidence': detection['confidence'], 
+                     'bbox': detection['bbox'],
+                     'extracted_text': extracted_text
+                 })
+        return organized_results
+            
+    def process_images(self, image_paths, user_id: str, task_id: str, confidence_threshold: float, verbose=True):
+        """Main pipeline function to process images in-memory without saving any intermediate or final files."""
+        try:
+            if verbose: logger.info(f"🚀 Starting In-Memory Pipeline for task {task_id}")
+
+            cropped_cards = self.detect_and_crop_cards(image_paths, confidence_threshold)
+            if not cropped_cards.get('front', []) and not cropped_cards.get('back', []):
+                return {'error': 'no_aadhar_detected'}
+            
+            # MODIFIED: Directly use cropped_cards instead of corrected_cards
+            all_detections = self.detect_entities_in_cards(cropped_cards, confidence_threshold)
+            
+            self.crop_entities(all_detections)
+
+            ocr_results = self.perform_multi_language_ocr(all_detections)
+            
+            organized_results = self.organize_results_by_card_type(all_detections, ocr_results, confidence_threshold)
+            
+            if verbose: logger.info("🎉 Pipeline processing completed successfully in memory.")
+            return {'organized_results': organized_results}
 
         except ValueError as ve: 
             logger.error(f"🚫 SECURITY ERROR in pipeline: {ve}")
@@ -308,16 +452,20 @@ class ComprehensiveAadhaarPipeline:
 app = FastAPI(
     title="Aadhaar Processing API",
     description="API for synchronously processing Aadhaar cards using YOLO and multi-language OCR.",
-    version="2.4.0-fully-in-memory"
+    version="2.4.0-central-config"
 )
 
 class Config:
     BASE_DIR = Path(__file__).parent
-    MODEL1_PATH = BASE_DIR / os.environ.get("MODEL1_PATH", "models/best_updated.pt")
+    MODEL1_PATH = BASE_DIR / os.environ.get("MODEL1_PATH", "models/best4.pt")
     MODEL2_PATH = BASE_DIR / os.environ.get("MODEL2_PATH", "models/best.pt")
-    ### REMOVED: OUTPUT_DIR is no longer used. ###
+    DOWNLOAD_DIR = BASE_DIR / Path(os.environ.get("DOWNLOAD_DIR", "downloads"))
+    
+    IMAGE_NOT_SCAN_DIR = Path(os.environ.get("IMAGE_NOT_SCAN_DIR", "/Users/hqpl/Desktop/aadhar_testing/AadharAuth/ImageNotScan"))
     SUMMARY_DATA_DIR = Path(os.environ.get("SUMMARY_DATA_DIR", "/Users/hqpl/Desktop/aadhar_testing/AadharAuth/data"))
-    DEFAULT_CONFIDENCE_THRESHOLD = float(os.environ.get("DEFAULT_CONFIDENCE_THRESHOLD", "0.4"))
+
+    # --- SINGLE SOURCE OF TRUTH FOR CONFIDENCE THRESHOLD ---
+    DEFAULT_CONFIDENCE_THRESHOLD = float(0.20)
 
 config = Config()
 pipeline: Optional[ComprehensiveAadhaarPipeline] = None
@@ -326,20 +474,21 @@ class AadhaarProcessRequest(BaseModel):
     user_id: str = "default_user"
     front_url: HttpUrl
     back_url: HttpUrl
-    confidence_threshold: float = Field(0.15, ge=0.0, le=1.0)
+    # MODIFIED: The default value for the API request is now taken from the central config.
+    confidence_threshold: float = Field(config.DEFAULT_CONFIDENCE_THRESHOLD, ge=0.0, le=1.0)
 
 @app.on_event("startup")
 async def startup_event():
     global pipeline
     try:
-        ### MODIFIED: Removed creation of unused directories ###
+        config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        config.IMAGE_NOT_SCAN_DIR.mkdir(parents=True, exist_ok=True)
         config.SUMMARY_DATA_DIR.mkdir(parents=True, exist_ok=True)
         
-        ### MODIFIED: Removed output_base_dir argument ###
+        # MODIFIED: Pipeline is now stateless regarding threshold, no need to pass it here.
         pipeline = ComprehensiveAadhaarPipeline(
             model1_path=str(config.MODEL1_PATH),
             model2_path=str(config.MODEL2_PATH),
-            confidence_threshold=config.DEFAULT_CONFIDENCE_THRESHOLD,
             other_lang_code='hin+tel+ben'
         )
         logger.info("✅ Pipeline models loaded successfully.")
@@ -347,18 +496,19 @@ async def startup_event():
         logger.critical(f"❌ Pipeline initialization failed: {e}", exc_info=True)
         sys.exit(1)
 
-async def download_image(session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
-    """Downloads image into memory as bytes, not to a file."""
+async def download_image(session: aiohttp.ClientSession, url: str, filepath: Path) -> bool:
     try:
         async with session.get(str(url), timeout=30) as response:
             response.raise_for_status()
-            return await response.read()
+            async with aiofiles.open(filepath, 'wb') as f:
+                await f.write(await response.read())
+            return True
     except Exception as e:
         logger.error(f"Download failed for {url}: {e}")
-        return None
+        return False
 
 def extract_main_fields(organized_results: Dict[str, Any]) -> Dict[str, Any]:
-    fields = ['aadharNumber', 'dob', 'gender', 'name', 'address', 'pincode', 'state']
+    fields = ['aadharnumber', 'dob', 'gender', 'name', 'address', 'pincode']
     data = {key: "" for key in fields}
     for side in ['front', 'back']:
         for card in organized_results.get(side, {}).values():
@@ -368,62 +518,151 @@ def extract_main_fields(organized_results: Dict[str, Any]) -> Dict[str, Any]:
                     first_valid_text = next((text for text in all_texts if text), '')
                     if first_valid_text:
                         data[field] = first_valid_text
+                        
+    if data['aadharnumber']:
+        data['aadharnumber'] = re.sub(r'\s+', '', data['aadharnumber'])
+    
+    if data.get('dob'):
+        # Extract all digit groups from dob string
+        digit_groups = re.findall(r'\d+', data['dob'])
+        digits_only = ''.join(digit_groups)
+        # If 8 digits, try to parse as ddmmyyyy
+        if len(digits_only) == 8:
+            try:
+                parsed_date = datetime.strptime(digits_only, '%d%m%Y')
+                data['dob'] = parsed_date.strftime('%d-%m-%Y')
+            except ValueError:
+                data['dob'] = 'Invalid Format'
+        else:
+            # If dob contains a year (e.g., 'Year of Birth : 1991'), use the first 4-digit group as year
+            year = next((g for g in digit_groups if len(g) == 4), None)
+            if year:
+                data['dob'] = year
+            else:
+                data['dob'] = 'Invalid Format'
+                
+    # --- Extract pincode from address if not valid ---
+    if data['pincode']:
+        digits_only = re.sub(r'\D', '', data['pincode'])
+        if len(digits_only) == 6:
+            data['pincode'] = digits_only
+        else:
+            # Try to extract from address
+            match = re.search(r'\b\d{6}\b', data.get('address', ''))
+            if match:
+                data['pincode'] = match.group(0)
+            else:
+                data['pincode'] = 'Invalid Format'
+    else:
+        # If pincode is empty, try to extract from address
+        match = re.search(r'\b\d{6}\b', data.get('address', ''))
+        if match:
+            data['pincode'] = match.group(0)
+        else:
+            data['pincode'] = 'Invalid Format'
+    
+    # --- Gender normalization (improved logic) ---
+    if data['gender']:
+        gender = data['gender'].strip().lower()
+        if gender == 'male':
+            data['gender'] = 'Male'
+        elif gender == 'female':
+            data['gender'] = 'Female'
+        else:
+            data['gender'] = 'Other'
+        
     return data
 
 @app.post("/verify_aadhar", response_class=JSONResponse, tags=["Aadhaar Processing"])
 async def verify_aadhaar_sync(request: AadhaarProcessRequest):
     if pipeline is None:
-        raise HTTPException(status_code=503, detail="Service Unavailable: Pipeline not initialized")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "service_unavailable"}
+        )
 
     task_id = hashlib.md5(f"{request.user_id}_{datetime.now().timestamp()}".encode()).hexdigest()
-    
+    user_download_dir = config.DOWNLOAD_DIR / request.user_id / task_id
+    user_download_dir.mkdir(parents=True, exist_ok=True)
+    front_path = user_download_dir / "front.jpg"
+    back_path = user_download_dir / "back.jpg"
+
     async with aiohttp.ClientSession() as session:
-        front_bytes, back_bytes = await asyncio.gather(
-            download_image(session, str(request.front_url)),
-            download_image(session, str(request.back_url))
+        downloads = await asyncio.gather(
+            download_image(session, str(request.front_url), front_path),
+            download_image(session, str(request.back_url), back_path)
         )
-        if not all([front_bytes, back_bytes]):
-            raise HTTPException(status_code=400, detail="Failed to download one or both Aadhaar images")
+        if not all(downloads):
+            shutil.rmtree(user_download_dir, ignore_errors=True)
+            return JSONResponse(
+                status_code=400,
+                content={"status": "failed_to_download_images"}
+            )
 
-    try:
-        front_array = cv2.imdecode(np.frombuffer(front_bytes, np.uint8), cv2.IMREAD_COLOR)
-        back_array = cv2.imdecode(np.frombuffer(back_bytes, np.uint8), cv2.IMREAD_COLOR)
-        if front_array is None or back_array is None:
-            raise ValueError("Could not decode one or both images. They might be corrupt or in an unsupported format.")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Image decoding failed: {e}")
-
-    result = pipeline.process_images([front_array, back_array], request.user_id, task_id, request.confidence_threshold)
+    # The threshold from the request (which defaults to the central config) is passed to the pipeline.
+    result = pipeline.process_images(
+        [str(front_path), str(back_path)], 
+        request.user_id, 
+        task_id, 
+        request.confidence_threshold
+    )
     
     if 'error' in result:
-        raise HTTPException(status_code=500, detail=result['error'])
+        shutil.rmtree(user_download_dir, ignore_errors=True)
+        error_content = {
+            "status": result.get("error", "error"),
+            # "step": result.get("step", "unknown")
+        }
+        if "security_flagged" in result:
+            error_content["security_flagged"] = result["security_flagged"]
+        if "traceback" in result:
+            error_content["traceback"] = result["traceback"]
+        return JSONResponse(
+            status_code=400 if result.get("error") == "no_aadhar_detected" else 500,
+            content=error_content
+        )
 
     organized = result.get('organized_results', {})
-    main_data = extract_main_fields(organized)
-    main_data['User ID'] = request.user_id
+    
+    # --- Card presence validation ---
+    detected_front = bool(organized.get('front')) and any(organized['front'])
+    detected_back = bool(organized.get('back')) and any(organized['back'])
+    if not detected_front and not detected_back:
+        return {
+            'status': 'no_aadhar_detected',
+            'detail': 'Neither front nor back card detected.'
+        }
+    elif not detected_front:
+        return {
+            'status': 'missing_front_card',
+        }
+    elif not detected_back:
+        return {
+            'status': 'missing_back_card',
+        }
 
-    if not result.get('front_detected'):
-        logger.info(f"❗ Front image for task {task_id} did not contain a detectable card.")
-    if not result.get('back_detected'):
-        logger.info(f"❗ Back image for task {task_id} did not contain a detectable card.")
+    main_data = extract_main_fields(organized)
+    main_data['user_id'] = request.user_id
 
     pkl_path = config.SUMMARY_DATA_DIR / "summary.pkl"
     csv_path = config.SUMMARY_DATA_DIR / "summary.csv"
     json_path = config.SUMMARY_DATA_DIR / "summary.json"
     
-    aadhar_number = main_data.get('aadharNumber', '').replace(' ', '')
+    aadhar_number = main_data.get('aadharnumber', '').replace(' ', '')
     if pkl_path.exists() and aadhar_number:
         try:
             with open(pkl_path, 'rb') as pf:
                 all_data = pickle.load(pf)
             for entry in all_data:
-                if entry.get('aadharNumber', '').replace(' ', '') == aadhar_number:
+                if entry.get('aadharnumber', '').replace(' ', '') == aadhar_number:
+                    shutil.rmtree(user_download_dir, ignore_errors=True)
                     minimal_data = {
-                        "name": entry.get("name", ""), "aadharNumber": entry.get("aadharNumber", ""),
-                        "matched_user_id": entry.get("User ID", "")
+                        "name": entry.get("name", ""),
+                        "aadharnumber": entry.get("aadharnumber", ""),
+                        "user_id": entry.get("user_id", "")
                     }
-                    logger.warning(f"Duplicate Aadhaar {aadhar_number} found for user {entry.get('User ID')}.")
-                    return JSONResponse(content={"status": "Aadhar Data Already Exists", "data": minimal_data})
+                    logger.warning(f"Duplicate Aadhaar {aadhar_number} found for user {entry.get('user_id')}.")
+                    return JSONResponse(content={"status": "aadhar_data_already_exists", "data": minimal_data})
         except Exception as e:
             logger.error(f"Failed to check PKL for duplicates: {e}")
 
@@ -447,6 +686,8 @@ async def verify_aadhaar_sync(request: AadhaarProcessRequest):
     except Exception as e:
         logger.error(f"Failed to update CSV file: {e}")
     
+    shutil.rmtree(user_download_dir, ignore_errors=True)
+
     for k, v in main_data.items():
         main_data[k] = "" if v is None else str(v)
 
@@ -481,6 +722,4 @@ async def health_check():
         )
 
 if __name__ == "__main__":
-    uvicorn.run("gpupipeline:app", host="0.0.0.0", port=8200, reload=True)
-    
-    
+    uvicorn.run("gpupipelineupdated:app", host="0.0.0.0", port=8200, reload=True)
