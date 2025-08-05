@@ -95,7 +95,7 @@ class ComprehensiveAadhaarPipeline:
 
     def detect_and_crop_cards(self, image_paths: List[str], confidence_threshold: float) -> Dict[str, List[Dict[str, Any]]]:
         """Step 1: Detect Aadhaar front/back cards and pass cropped image data (np.array) forward."""
-        logger.info(f"\n🔍 Step 1: Detecting Aadhaar cards in {len(image_paths)} images (Threshold: {confidence_threshold})")
+        logger.info(f"\nStep 1: Detecting Aadhaar cards in {len(image_paths)} images (Threshold: {confidence_threshold})")
         cropped_cards = {'front': [], 'back': []}
         for image_path in image_paths:
             logger.info(f"  Processing: {Path(image_path).name}")
@@ -121,13 +121,13 @@ class ComprehensiveAadhaarPipeline:
                 cropped_cards[card_type].append(card_data)
                 logger.info(f"    ✅ Detected {class_name}")
             if not detected:
-                logger.warning(f"    ⚠️ No Aadhaar card detected in {Path(image_path).name}.")
+                logger.warning(f" No Aadhaar card detected in {Path(image_path).name}.")
         return cropped_cards
 
     def detect_entities_in_cards(self, cropped_cards: Dict[str, List[Dict[str, Any]]], confidence_threshold: float):
         """Step 2: Detect entities using in-memory card image data."""
         all_card_data = cropped_cards.get('front', []) + cropped_cards.get('back', [])
-        logger.info(f"\n🔍 Step 2: Detecting entities in {len(all_card_data)} cards (Threshold: {confidence_threshold})")
+        logger.info(f"\nStep 2: Detecting entities in {len(all_card_data)} cards (Threshold: {confidence_threshold})")
         all_detections = {}
 
         for card_info in all_card_data:
@@ -155,7 +155,7 @@ class ComprehensiveAadhaarPipeline:
 
     def crop_entities(self, all_detections: Dict[str, Dict[str, Any]]):
         """Step 3: Crop individual entities and add their image data to the detection dictionary."""
-        logger.info(f"\n✂️  Step 3: Cropping individual entities")
+        logger.info(f"\nStep 3: Cropping individual entities")
         for card_name, card_data in all_detections.items():
             img = card_data['card_image']
             for i, detection in enumerate(card_data['detections']):
@@ -362,7 +362,7 @@ class ComprehensiveAadhaarPipeline:
 
     def perform_multi_language_ocr(self, all_detections: Dict[str, Dict[str, Any]]):
         """Step 4: Correcting orientation and perform OCR on in-memory entity images."""
-        logger.info(f"\n📝 Step 4: Correcting Entity Orientation & Performing Multi-Language OCR")
+        logger.info(f"\nStep 4: Correcting Entity Orientation & Performing Multi-Language OCR")
         ocr_results = {}
         for card_name, card_data in all_detections.items():
             for detection in card_data['detections']:
@@ -389,7 +389,7 @@ class ComprehensiveAadhaarPipeline:
 
     def organize_results_by_card_type(self, all_detections: Dict[str, Dict[str, Any]], ocr_results: Dict[str, str], confidence_threshold: float):
         """Step 5: Organizing final results from in-memory data structures."""
-        logger.info("\n🗂️  Step 5: Organizing final results")
+        logger.info("\nStep 5: Organizing final results")
         organized_results = {
             'front': {}, 'back': {},
             'metadata': {
@@ -421,7 +421,7 @@ class ComprehensiveAadhaarPipeline:
     def process_images(self, image_paths, user_id: str, task_id: str, confidence_threshold: float, verbose=True):
         """Main pipeline function to process images in-memory without saving any intermediate or final files."""
         try:
-            if verbose: logger.info(f"🚀 Starting In-Memory Pipeline for task {task_id}")
+            if verbose: logger.info(f"Starting In-Memory Pipeline for task {task_id}")
 
             cropped_cards = self.detect_and_crop_cards(image_paths, confidence_threshold)
             if not cropped_cards.get('front', []) and not cropped_cards.get('back', []):
@@ -436,14 +436,14 @@ class ComprehensiveAadhaarPipeline:
             
             organized_results = self.organize_results_by_card_type(all_detections, ocr_results, confidence_threshold)
             
-            if verbose: logger.info("🎉 Pipeline processing completed successfully in memory.")
+            if verbose: logger.info("Pipeline processing completed successfully in memory.")
             return {'organized_results': organized_results}
 
         except ValueError as ve: 
-            logger.error(f"🚫 SECURITY ERROR in pipeline: {ve}")
+            logger.error(f"SECURITY ERROR in pipeline: {ve}")
             return {'error': str(ve), 'security_flagged': True, 'step': 'card_detection'}
         except Exception as e:
-            logger.error(f"❌ Unhandled error in pipeline: {e}\n{traceback.format_exc()}")
+            logger.error(f"Unhandled error in pipeline: {e}\n{traceback.format_exc()}")
             return {'error': str(e), 'traceback': traceback.format_exc(), 'step': 'unknown'}
 
 
@@ -461,8 +461,8 @@ class Config:
     MODEL2_PATH = BASE_DIR / os.environ.get("MODEL2_PATH", "models/best.pt")
     DOWNLOAD_DIR = BASE_DIR / Path(os.environ.get("DOWNLOAD_DIR", "downloads"))
     
-    IMAGE_NOT_SCAN_DIR = Path(os.environ.get("IMAGE_NOT_SCAN_DIR", "/Users/hqpl/Desktop/aadhar_testing/AadharAuth/ImageNotScan"))
-    SUMMARY_DATA_DIR = Path(os.environ.get("SUMMARY_DATA_DIR", "/Users/hqpl/Desktop/aadhar_testing/AadharAuth/data"))
+    IMAGE_NOT_SCAN_DIR = Path(os.environ.get("IMAGE_NOT_SCAN_DIR"))
+    SUMMARY_DATA_DIR = Path(os.environ.get("SUMMARY_DATA_DIR"))
 
     # --- SINGLE SOURCE OF TRUTH FOR CONFIDENCE THRESHOLD ---
     DEFAULT_CONFIDENCE_THRESHOLD = float(0.20)
@@ -572,6 +572,29 @@ def extract_main_fields(organized_results: Dict[str, Any]) -> Dict[str, Any]:
             data['gender'] = 'Other'
         
     return data
+############################
+def load_data():
+    data = {}
+    if os.path.exists(csv_path):
+        data['csv'] = pd.read_csv(csv_path)
+    if os.path.exists(json_path):
+        with open(json_path, 'r') as f:
+            data['json'] = pd.DataFrame(json.load(f))
+    if os.path.exists(pkl_path):
+        with open(pkl_path, 'rb') as f:
+            data['pkl'] = pickle.load(f)
+    return data
+
+def save_data(data):
+    data['csv'].to_csv(csv_path, index=False)
+    data['json'].to_json(json_path, orient='records', indent=2)
+    with open(pkl_path, 'wb') as f:
+        pickle.dump(data['pkl'], f)
+        
+
+
+####################
+
 
 @app.post("/verify_aadhar", response_class=JSONResponse, tags=["Aadhaar Processing"])
 async def verify_aadhaar_sync(request: AadhaarProcessRequest):
@@ -692,6 +715,113 @@ async def verify_aadhaar_sync(request: AadhaarProcessRequest):
         main_data[k] = "" if v is None else str(v)
 
     return JSONResponse(content={"status": "saved", "data": main_data})
+
+
+
+
+##############################
+@app.get("/user/{user_id}", tags=["Aadhaar Processing"])
+def get_user_data(user_id: str):
+    pkl_path = config.SUMMARY_DATA_DIR / "summary.pkl"
+    csv_path = config.SUMMARY_DATA_DIR / "summary.csv"
+    json_path = config.SUMMARY_DATA_DIR / "summary.json"
+
+    output = {}
+
+    if pkl_path.exists():
+        try:
+            with open(pkl_path, 'rb') as pf:
+                pkl_data = pickle.load(pf)
+            output["pkl"] = [entry for entry in pkl_data if entry.get("user_id") == user_id]
+        except Exception as e:
+            logger.error(f"Error reading PKL: {e}")
+            output["pkl"] = []
+
+    # if csv_path.exists():
+    #     try:
+    #         csv_df = pd.read_csv(csv_path)
+    #         output["csv"] = csv_df[csv_df["user_id"] == user_id].to_dict(orient="records")
+    #     except Exception as e:
+    #         logger.error(f"Error reading CSV: {e}")
+    #         output["csv"] = []
+
+    # if json_path.exists():
+    #     try:
+    #         with open(json_path, 'r', encoding='utf-8') as jf:
+    #             json_data = json.load(jf)
+    #         output["json"] = [json_data] if json_data.get("user_id") == user_id else []
+    #     except Exception as e:
+    #         logger.error(f"Error reading JSON: {e}")
+    #         output["json"] = []
+
+    if all(len(v) == 0 for v in output.values()):
+        return JSONResponse(
+            status_code=404,
+            content={"status": "user_not_found"}
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={"status": "found", "data": output}
+    )
+
+
+@app.delete("/user/{user_id}", tags=["Aadhaar Processing"])
+def delete_user_data(user_id: str):
+    pkl_path = config.SUMMARY_DATA_DIR / "summary.pkl"
+    csv_path = config.SUMMARY_DATA_DIR / "summary.csv"
+    json_path = config.SUMMARY_DATA_DIR / "summary.json"
+
+    user_found = False
+
+    # --- PKL ---
+    if pkl_path.exists():
+        try:
+            with open(pkl_path, 'rb') as pf:
+                pkl_data = pickle.load(pf)
+            new_pkl_data = [entry for entry in pkl_data if entry.get("user_id") != user_id]
+            if len(pkl_data) != len(new_pkl_data):
+                user_found = True
+                with open(pkl_path, 'wb') as pf:
+                    pickle.dump(new_pkl_data, pf)
+        except Exception as e:
+            logger.error(f"Error updating PKL: {e}")
+
+    # --- CSV ---
+    if csv_path.exists():
+        try:
+            csv_df = pd.read_csv(csv_path)
+            csv_df["user_id"] = csv_df["user_id"].astype(str)
+            original_len = len(csv_df)
+            new_csv_df = csv_df[csv_df["user_id"] != str(user_id)]
+            if len(new_csv_df) < original_len:
+                user_found = True
+                new_csv_df.to_csv(csv_path, index=False)
+        except Exception as e:
+            logger.error(f"Error updating CSV: {e}")
+    # --- JSON ---
+    if json_path.exists():
+        try:
+            with open(json_path, 'r', encoding='utf-8') as jf:
+                json_data = json.load(jf)
+            if json_data.get("user_id") == user_id:
+                user_found = True
+                os.remove(json_path)
+        except Exception as e:
+            logger.error(f"Error deleting JSON: {e}")
+
+    if not user_found:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "user_not_found"}
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={"status": "deleted", "user_id": user_id}
+    )
+
+##############################
 
 @app.get("/health", tags=["Monitoring"])
 async def health_check():
